@@ -113,7 +113,7 @@ $driveRoot = [IO.Path]::GetPathRoot($InstallDir)
 try {
 	$free = (Get-PSDrive -Name $driveRoot.TrimEnd(':\') -ErrorAction Stop).Free
 	if ($free -lt ($MinFreeDiskMB * 1MB)) {
-		Die $EX_PREREQ ("not enough free space on {0}: {1} MiB available, {2} MiB required. The agent writes its unrotated log, its rotating transaction/connection logs and its credential here - free up space, choose another -InstallDir, or lower the floor with AISPM_MIN_FREE_DISK_MB" -f $driveRoot, [int]($free/1MB), $MinFreeDiskMB)
+		Die $EX_PREREQ ("not enough free space on {0}: {1} MiB available, {2} MiB required. The agent writes its rotating agent log, its rotating transaction/connection logs and its credential here - free up space, choose another -InstallDir, or lower the floor with AISPM_MIN_FREE_DISK_MB" -f $driveRoot, [int]($free/1MB), $MinFreeDiskMB)
 	}
 } catch { Warn "could not determine the free space on $driveRoot" }
 Say "Administrator, tar.exe, free space (>= $MinFreeDiskMB MiB): ok"
@@ -289,7 +289,8 @@ try {
 			"  bootstrap_token_file: $tokenPath",
 			"logging:",
 			"  output: $logsDir\agent.log",
-			"  truncate: false"
+			"  truncate: false",
+			"  max_size_mb: 50"
 		) | Set-Content -LiteralPath (Join-Path $configDir 'agent.yaml') -Encoding ASCII
 		# Only written when it differs from the agent's own default, so agent.yaml does not carry a
 		# redundant setting — but a floor the operator chose here also governs every later start.
@@ -341,7 +342,8 @@ try {
 	Write-Host "  & '$InstallDir\$AgentBin' -config '$configDir'"
 	Write-Host ""
 	Write-Host "  (The log destination is already set in $configDir\agent.yaml - $logsDir\agent.log,"
-	Write-Host "   appended to rather than truncated. That log is NOT rotated: watch $logsDir.)"
+	Write-Host "   appended to rather than truncated, and size-bounded by rotation (logging.max_size_mb,"
+	Write-Host "   50 MiB; current file plus one rotated agent.log.1, so ~2x that on disk).)"
 	Write-Host ""
 	Write-Host "Stop it CLEANLY - Ctrl+C in its console, or:"
 	Write-Host ""
