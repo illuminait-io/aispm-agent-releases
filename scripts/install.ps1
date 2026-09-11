@@ -198,7 +198,9 @@ New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
 	function Get-Verified { param([string]$url, [string]$sha256, [string]$dest, [string]$label)
 		Say $url
-		try { Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $dest -TimeoutSec 600 }
+		# The agent is ~190 MB: TimeoutSec here bounds the whole transfer, so it has to allow for a
+		# slow link rather than a fast one.
+		try { Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $dest -TimeoutSec 3600 }
 		catch { Die $EX_DOWNLOAD "cannot download $label from $url ($($_.Exception.Message))" }
 		$got = (Get-FileHash -Algorithm SHA256 -LiteralPath $dest).Hash.ToLower()
 		if ($got -ne $sha256.ToLower()) {

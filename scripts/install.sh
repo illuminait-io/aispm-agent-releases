@@ -305,7 +305,10 @@ verify() { # <file> <expected sha256> <label>
 # --------------------------------------------------------------- 5. binary + config
 step "Downloading the agent"
 say "  $bin_url"
-curl -fsSL --max-time 600 -o "$tmp/$AGENT_BIN" "$bin_url" || die $EX_DOWNLOAD "cannot download the agent binary from $bin_url"
+# The Windows agent is ~190 MB, so a flat deadline would fail a perfectly healthy download on a
+# slow link. Abort on a STALLED transfer instead (under 10 KB/s for a minute), with a generous
+# overall ceiling.
+curl -fsSL --speed-limit 10240 --speed-time 60 --max-time 3600 -o "$tmp/$AGENT_BIN" "$bin_url" || die $EX_DOWNLOAD "cannot download the agent binary from $bin_url (interrupted or stalled)"
 verify "$tmp/$AGENT_BIN" "$bin_sha" "the agent binary"
 chmod 0755 "$tmp/$AGENT_BIN"
 mv -f "$tmp/$AGENT_BIN" "$install_dir/$AGENT_BIN"
@@ -313,7 +316,7 @@ say "  installed $install_dir/$AGENT_BIN (sha256 verified)"
 
 step "Installing the configuration"
 say "  $cfg_url"
-curl -fsSL --max-time 600 -o "$tmp/config.tar.gz" "$cfg_url" || die $EX_DOWNLOAD "cannot download the configuration bundle from $cfg_url"
+curl -fsSL --speed-limit 10240 --speed-time 60 --max-time 600 -o "$tmp/config.tar.gz" "$cfg_url" || die $EX_DOWNLOAD "cannot download the configuration bundle from $cfg_url (interrupted or stalled)"
 verify "$tmp/config.tar.gz" "$cfg_sha" "the configuration bundle"
 mkdir -p "$tmp/config"
 tar -xzf "$tmp/config.tar.gz" -C "$tmp/config" || die $EX_FAIL "cannot unpack the configuration bundle"
