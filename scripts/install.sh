@@ -23,6 +23,7 @@
 #   6  the platform is not reachable
 #   7  download or checksum failure
 #   8  the agent's preflight refused this host
+#   9  the host checks out, but the agent does not support this OS yet (nothing was installed)
 #   10 bootstrap token invalid, expired, revoked or already used
 #   11 platform unreachable from the agent
 #   12 agent configuration error
@@ -30,7 +31,7 @@
 set -eu
 
 EX_OK=0; EX_FAIL=1; EX_USAGE=2; EX_UNSUPPORTED=3; EX_PREREQ=4
-EX_PRIVILEGE=5; EX_PLATFORM=6; EX_DOWNLOAD=7; EX_PREFLIGHT=8
+EX_PRIVILEGE=5; EX_PLATFORM=6; EX_DOWNLOAD=7; EX_PREFLIGHT=8; EX_OS_NOT_YET=9
 
 # Defaults. --manifest-url (or installer.conf) overrides the whole resolution chain.
 RELEASES_OWNER="${AISPM_RELEASES_OWNER:-illuminait-io}"
@@ -68,6 +69,11 @@ Usage: install.sh [options]
   --install-dir PATH   install root (default: /opt/IlluminaIT)
   --re-enroll          discard the stored credential and enrol again (needs a fresh token)
   -h, --help           this help
+
+Environment:
+  AISPM_ALLOW_UNSUPPORTED_OS=1   install on Linux/macOS anyway (the agent enrols and heartbeats
+                                 but observes nothing there). Testing only.
+  AISPM_MIN_FREE_DISK_MB=<MiB>   override the free-space floor (default 2048)
 USAGE
 }
 
@@ -182,6 +188,38 @@ elif [ "$ping_code" = "000" ]; then
 else
 	die $EX_PLATFORM "$platform_url$PING_PATH answered HTTP $ping_code, not 200: the URL does not reach the agent API (wrong host, or a proxy that does not route /aispm/api/v1/agent/)"
 fi
+
+# ------------------------------------------------- 2b. this OS is not supported yet
+# Everything above is a genuine validation of the host — architecture, elevation, tooling, disk
+# space, and that the platform is reachable from here — and it is worth running on its own.
+#
+# But the agent is not supported on Linux or macOS yet: it would enrol, heartbeat, and observe
+# nothing on the host — worse than not being installed, since the fleet would then show a healthy
+# agent reporting an empty picture. The platform refuses to issue an installer package for these
+# OSes for the same reason. So stop here, having told the operator what was verified.
+#
+# AISPM_ALLOW_UNSUPPORTED_OS=1 proceeds anyway — for enrollment and platform-integration testing,
+# where an agent that enrols and heartbeats is exactly what is wanted.
+if [ "${AISPM_ALLOW_UNSUPPORTED_OS:-0}" != "1" ]; then
+	cat <<NOTSUPPORTED
+
+==> This host checks out, but the agent does not support $os yet.
+
+  Verified: $os/$arch, root privileges, curl/tar/sha256, free disk space,
+  and that $platform_url is reachable from here.
+
+  Not installed, on purpose: the agent is not supported on $os yet — it would enrol and send
+  heartbeats while observing nothing on this host, so the fleet would show a healthy agent
+  reporting an empty picture. Windows is the supported platform for this release.
+
+  Install the agent on a Windows host (install.ps1 or install.cmd from the same package).
+  To install here anyway for enrollment or platform-integration testing:
+    AISPM_ALLOW_UNSUPPORTED_OS=1 $0 ...
+
+NOTSUPPORTED
+	exit $EX_OS_NOT_YET
+fi
+warn "AISPM_ALLOW_UNSUPPORTED_OS=1: installing on $os, where the agent observes nothing. For testing only."
 
 # ------------------------------------------------------------- 3. release resolution
 # Minimal JSON readers. The manifest and channel files are produced by our own release CI, and
@@ -390,8 +428,8 @@ Stop it CLEANLY — Ctrl+C, or:
 
   sudo kill -TERM \$(pgrep -f '$AGENT_BIN -config')
 
-  NEVER 'kill -9'. The agent must unhook the processes it instrumented; killing it hard can
-  crash or freeze the applications it was watching.
+  NEVER 'kill -9'. A hard kill can crash or freeze the applications the agent was monitoring,
+  and loses whatever it had not yet reported. Always let it shut down.
 
 Logs:       $logs_dir
 Config:     $config_dir   (agent.yaml, catalogues, credential.json)
