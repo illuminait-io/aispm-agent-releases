@@ -50,7 +50,10 @@ $InstallRootDefault = 'C:\IlluminaIT'
 $AgentBin = 'aispm-agent.exe'
 $IncompleteMarker = '.install-incomplete'
 $PingPath = '/aispm/api/v1/agent/ping'
-$MinFreeBytes = 256MB
+# Free-space floor. Same default as the agent's own preflight.min_free_disk_mb (2 GiB), so the
+# installer refuses before downloading rather than letting the agent refuse after.
+# AISPM_MIN_FREE_DISK_MB overrides both: applied here AND seeded into agent.yaml.
+$MinFreeDiskMB = if ($env:AISPM_MIN_FREE_DISK_MB) { [int]$env:AISPM_MIN_FREE_DISK_MB } else { 2048 }
 
 function Say  { param([string]$m) Write-Host "  $m" }
 function Step { param([string]$m) Write-Host ""; Write-Host "==> $m" }
@@ -109,11 +112,11 @@ if (-not (Get-Command tar.exe -ErrorAction SilentlyContinue)) {
 $driveRoot = [IO.Path]::GetPathRoot($InstallDir)
 try {
 	$free = (Get-PSDrive -Name $driveRoot.TrimEnd(':\') -ErrorAction Stop).Free
-	if ($free -lt $MinFreeBytes) {
-		Die $EX_PREREQ "not enough free space on $driveRoot : $([int]($free/1MB)) MiB available, $([int]($MinFreeBytes/1MB)) MiB required"
+	if ($free -lt ($MinFreeDiskMB * 1MB)) {
+		Die $EX_PREREQ ("not enough free space on {0}: {1} MiB available, {2} MiB required. The agent writes its unrotated log, its rotating transaction/connection logs and its credential here - free up space, choose another -InstallDir, or lower the floor with AISPM_MIN_FREE_DISK_MB" -f $driveRoot, [int]($free/1MB), $MinFreeDiskMB)
 	}
 } catch { Warn "could not determine the free space on $driveRoot" }
-Say "Administrator, tar.exe, free space: ok"
+Say "Administrator, tar.exe, free space (>= $MinFreeDiskMB MiB): ok"
 
 Step "Checking that the platform is reachable"
 # A strict 200 on the liveness endpoint. Any other answer means the URL reaches something that is
@@ -254,12 +257,25 @@ try {
 
 	if (-not (Test-Path -LiteralPath (Join-Path $configDir 'agent.yaml'))) {
 		$stamp = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+		# The logging settings are seeded, not left to the run command: it makes the preflight
+		# below exercise the FATAL log-writable check (which only exists when logging.output is a
+		# file), so an unwritable log directory is caught here instead of at the operator's first
+		# launch. It also keeps truncate off - the default empties the log at every start.
 		@(
 			"# Written by install.ps1 $stamp - agent $Version",
 			"platform:",
 			"  url: $PlatformUrl",
-			"  bootstrap_token_file: $($tokenPath -replace '\\','\\')"
+			"  bootstrap_token_file: $tokenPath",
+			"logging:",
+			"  output: $logsDir\agent.log",
+			"  truncate: false"
 		) | Set-Content -LiteralPath (Join-Path $configDir 'agent.yaml') -Encoding ASCII
+		# Only written when it differs from the agent's own default, so agent.yaml does not carry a
+		# redundant setting — but a floor the operator chose here also governs every later start.
+		if ($MinFreeDiskMB -ne 2048) {
+			@("preflight:", "  min_free_disk_mb: $MinFreeDiskMB") |
+				Add-Content -LiteralPath (Join-Path $configDir 'agent.yaml') -Encoding ASCII
+		}
 		Say "wrote $configDir\agent.yaml"
 	} else {
 		Say "kept the existing $configDir\agent.yaml"
@@ -301,11 +317,10 @@ try {
 	Write-Host ""
 	Write-Host "Start the agent (elevated PowerShell):"
 	Write-Host ""
-	Write-Host "  & '$InstallDir\$AgentBin' -config '$configDir' ``"
-	Write-Host "      -logging-output '$logsDir\agent.log' -logging-truncate=false"
+	Write-Host "  & '$InstallDir\$AgentBin' -config '$configDir'"
 	Write-Host ""
-	Write-Host "  (-logging-truncate=false keeps the log across restarts; the default empties it at startup."
-	Write-Host "   The agent log is not rotated - watch $logsDir.)"
+	Write-Host "  (The log destination is already set in $configDir\agent.yaml - $logsDir\agent.log,"
+	Write-Host "   appended to rather than truncated. That log is NOT rotated: watch $logsDir.)"
 	Write-Host ""
 	Write-Host "Stop it CLEANLY - Ctrl+C in its console, or:"
 	Write-Host ""

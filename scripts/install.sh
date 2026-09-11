@@ -41,7 +41,10 @@ AGENT_BIN="aispm-agent"
 # Marker dropped before the first mutation and removed on success: a re-run knows it is resuming.
 INCOMPLETE_MARKER=".install-incomplete"
 PING_PATH="/aispm/api/v1/agent/ping"
-MIN_FREE_KB=262144 # 256 MiB: binary + config + room for the first logs
+# Free-space floor, in MiB. Same default as the agent's own preflight.min_free_disk_mb (2 GiB), so
+# the installer refuses before downloading anything rather than letting the agent refuse after.
+# AISPM_MIN_FREE_DISK_MB overrides both: it is applied here AND seeded into agent.yaml.
+MIN_FREE_MB="${AISPM_MIN_FREE_DISK_MB:-2048}"
 
 platform_url=""; token=""; token_file=""; version=""; channel=""
 manifest_url=""; install_dir=""; re_enroll=0
@@ -157,12 +160,12 @@ fi
 
 parent_dir="$install_dir"
 while [ ! -d "$parent_dir" ] && [ "$parent_dir" != "/" ]; do parent_dir=$(dirname -- "$parent_dir"); done
-free_kb=$(df -Pk "$parent_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo 0)
-case "$free_kb" in
+free_mb=$(df -Pm "$parent_dir" 2>/dev/null | awk 'NR==2 {print $4}' || echo "")
+case "$free_mb" in
 ''|*[!0-9]*) warn "could not determine the free space on $parent_dir" ;;
-*) [ "$free_kb" -ge "$MIN_FREE_KB" ] || die $EX_PREREQ "not enough free space on $parent_dir: $((free_kb/1024)) MiB available, $((MIN_FREE_KB/1024)) MiB required" ;;
+*) [ "$free_mb" -ge "$MIN_FREE_MB" ] || die $EX_PREREQ "not enough free space on $parent_dir: $free_mb MiB available, $MIN_FREE_MB MiB required. The agent writes its unrotated log, its rotating transaction/connection logs and its credential here — free up space, choose another --install-dir, or lower the floor with AISPM_MIN_FREE_DISK_MB" ;;
 esac
-say "  root privileges, curl, tar, sha256, free space: ok"
+say "  root privileges, curl, tar, sha256, free space (>= ${MIN_FREE_MB} MiB): ok"
 
 step "Checking that the platform is reachable"
 # A strict 200 on the liveness endpoint. Any other answer means the URL reaches something that
@@ -309,12 +312,24 @@ fi
 # agent.yaml carries the two settings the agent needs to enrol. Written only when absent, so a
 # re-run never clobbers an operator's edits.
 if [ ! -f "$config_dir/agent.yaml" ]; then
+	# The logging settings are seeded, not left to the run command: it makes the preflight below
+	# exercise the FATAL log-writable check (which only exists when logging.output is a file), so an
+	# unwritable log directory is caught here instead of at the operator's first launch. It also
+	# keeps truncate off — the default empties the log at every start.
 	cat > "$config_dir/agent.yaml" <<YAML
 # Written by install.sh $(date -u +%Y-%m-%dT%H:%M:%SZ) — agent $version
 platform:
   url: $platform_url
   bootstrap_token_file: $token_path
+logging:
+  output: $logs_dir/agent.log
+  truncate: false
 YAML
+	# Only written when it differs from the agent's own default, so agent.yaml does not carry a
+	# redundant setting — but a floor the operator chose here also governs every later start.
+	if [ "$MIN_FREE_MB" != "2048" ]; then
+		printf 'preflight:\n  min_free_disk_mb: %s\n' "$MIN_FREE_MB" >> "$config_dir/agent.yaml"
+	fi
 	chmod 0640 "$config_dir/agent.yaml"
 	say "  wrote $config_dir/agent.yaml"
 else
@@ -366,11 +381,10 @@ cat <<FINAL
 
 Start the agent:
 
-  sudo $install_dir/$AGENT_BIN -config $config_dir \\
-       -logging-output $logs_dir/agent.log -logging-truncate=false
+  sudo $install_dir/$AGENT_BIN -config $config_dir
 
-  (-logging-truncate=false keeps the log across restarts; the default empties it at startup.
-   The agent log is not rotated — watch $logs_dir.)
+  (The log destination is already set in $config_dir/agent.yaml — $logs_dir/agent.log,
+   appended to rather than truncated. That log is NOT rotated: watch $logs_dir.)
 
 Stop it CLEANLY — Ctrl+C, or:
 
