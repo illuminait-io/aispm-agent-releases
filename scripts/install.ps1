@@ -141,8 +141,27 @@ if ($pingCode -eq 200) {
 # ------------------------------------------------------------- 3. release resolution
 Step "Resolving the release"
 function Fetch-Json { param([string]$url)
-	try { return (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60).Content | ConvertFrom-Json }
-	catch { Die $EX_DOWNLOAD "cannot fetch $url ($($_.Exception.Message))" }
+	# Retried: the channel file is served through a CDN that can briefly 404 or serve a stale copy
+	# right after a release is cut (observed). One transient 404 must not be reported to the
+	# operator as "this release channel does not exist".
+	$lastErr = $null
+	for ($i = 1; $i -le 3; $i++) {
+		try {
+			# GitHub serves release assets as application/octet-stream, so under Windows
+			# PowerShell 5.1 .Content is a Byte[] (not a string) and Byte[] | ConvertFrom-Json
+			# silently yields $null — the manifest would parse to nothing and the installer would
+			# report "no version field". Decode to UTF-8 text before parsing.
+			$content = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60).Content
+			if ($content -is [byte[]]) { $content = [Text.Encoding]::UTF8.GetString($content) }
+			$parsed = $content | ConvertFrom-Json
+			if (-not $parsed) { throw "empty or unparseable JSON" }
+			return $parsed
+		} catch {
+			$lastErr = $_.Exception.Message
+			if ($i -lt 3) { Start-Sleep -Seconds ($i * 3) }
+		}
+	}
+	Die $EX_DOWNLOAD "cannot fetch $url ($lastErr)"
 }
 if (-not $ManifestUrl) {
 	if ($Version) {

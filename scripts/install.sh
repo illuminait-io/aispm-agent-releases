@@ -236,7 +236,22 @@ json_object() { # <json> <key> -> the {...} value of that key
 }
 
 fetch() { # <url> -> body on stdout
-	curl -fsSL --max-time 60 "$1" || return 1
+	# Retried: the channel file is served through a CDN that can briefly 404 or serve a stale copy
+	# right after a release is cut (observed). One transient 404 must not be reported to the
+	# operator as "this release channel does not exist".
+	i=1
+	while [ "$i" -le 3 ]; do
+		if [ "$i" -lt 3 ]; then
+			# Quiet on the attempts that will be retried: three "curl: (56) 404" lines ahead of
+			# the real message only obscures it.
+			curl -fsSL --max-time 60 "$1" 2>/dev/null && return 0
+			sleep $((i * 3))
+		else
+			curl -fsSL --max-time 60 "$1" && return 0
+		fi
+		i=$((i + 1))
+	done
+	return 1
 }
 
 step "Resolving the release"
