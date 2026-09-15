@@ -318,7 +318,7 @@ try {
 		Die $EX_PREFLIGHT "the agent's preflight refused this host (see the failed checks and their remediation above)"
 	}
 
-	Step "Enrolling with $PlatformUrl"
+	Step "Enrolling agent $Version with $PlatformUrl"
 	& (Join-Path $InstallDir $AgentBin) -enroll-only -config $configDir
 	$enrollCode = $LASTEXITCODE
 	if ($enrollCode -ne 0) {

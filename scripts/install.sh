@@ -409,7 +409,7 @@ pf_code=$?
 set -e
 [ "$pf_code" -eq 0 ] || die $EX_PREFLIGHT "the agent's preflight refused this host (see the failed checks and their remediation above)"
 
-step "Enrolling with $platform_url"
+step "Enrolling agent $version with $platform_url"
 set +e
 "$install_dir/$AGENT_BIN" -enroll-only -config "$config_dir"
 enroll_code=$?
