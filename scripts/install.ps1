@@ -6,12 +6,29 @@
   Two modes, same script:
     package   - run from the unzipped installer package; reads installer.conf + bootstrap.token
                 sitting next to this script.
-    one-liner - iwr <platform>/aispm/api/v1/agent/install.ps1 | iex, then call with -PlatformUrl
-                and -Token (see the package README for the exact snippet).
+    one-liner - one line, from an elevated cmd.exe or PowerShell, nothing written to disk:
+                  powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; & ([scriptblock]::Create((iwr -UseBasicParsing '<platform>/aispm/api/v1/agent/install.ps1').Content)) -PlatformUrl '<platform>'"
+                With no -Token/-TokenFile the token is asked for in the console, hidden, so the
+                line an operator pastes carries no secret; add -Token '...' to run unattended.
+                The CHILD powershell is not optional: this script ends with `exit <code>`, and a
+                scriptblock run directly in your own console (iex, or & on it) has no script scope
+                for `exit` to end — it closes the console instead, taking the error with it. The
+                child exits with the code below and leaves it in $LASTEXITCODE / %ERRORLEVEL%.
 
   It detects the architecture, checks the prerequisites, lays out the install directory, downloads
   the binary and the configuration for the resolved release (SHA256 verified), gates on the agent's
   own preflight, enrols the host, and prints the exact command to run it.
+
+  -Service registers the agent as a Windows service (automatic start, restart on failure) instead of
+  leaving you a command to run. That is what a host nobody will log into again needs: a console agent
+  does not survive a reboot, and it cannot be restarted after an automatic update. The service is
+  stoppable cleanly (Stop-Service), which a Scheduled Task is not — the agent implements the service
+  control handler, so the SCM's Stop reaches its shutdown path and its in-target hooks are released
+  properly. -NoService forces the console arrangement.
+
+  -Uninstall stops the agent gracefully and deletes the install directory, removing the service first
+  if there is one. It needs no token and no -PlatformUrl. Revoke the agent's key in the console
+  afterwards: the files are gone, the credential it held was still valid.
 
   Exit codes. Below 10 the installer itself failed; 10 and above are the agent's frozen enrollment
   codes, passed through unchanged (see docs/installer-distribution-plan.md section 2c):
@@ -32,7 +49,10 @@ param(
 	[string]$Channel,
 	[string]$ManifestUrl,
 	[string]$InstallDir,
-	[switch]$ReEnroll
+	[switch]$ReEnroll,
+	[switch]$Uninstall,
+	[switch]$Service,
+	[switch]$NoService
 )
 
 Set-StrictMode -Version Latest
@@ -48,6 +68,9 @@ $ReleasesRepo = 'aispm-agent-releases'
 $DefaultChannel = 'stable'
 $InstallRootDefault = 'C:\IlluminaIT'
 $AgentBin = 'aispm-agent.exe'
+# StopScriptName is both the manifest's tools key and the file's name on the host: the closing
+# instructions print its installed path, so the two must be the same string.
+$StopScriptName = 'stop-agent-graceful.ps1'
 $IncompleteMarker = '.install-incomplete'
 $PingPath = '/aispm/api/v1/agent/ping'
 # Free-space floor. Same default as the agent's own preflight.min_free_disk_mb (2 GiB), so the
@@ -60,8 +83,202 @@ function Step { param([string]$m) Write-Host ""; Write-Host "==> $m" }
 function Warn { param([string]$m) Write-Warning $m }
 function Die  { param([int]$code, [string]$m) Write-Host "error: $m" -ForegroundColor Red; exit $code }
 
+# ---------------------------------------------------------------- Windows service helpers
+#
+# The agent implements the service control handler (cmd/aispm-agent/service_windows.go), which is
+# what makes a service viable here at all. The older note in docs/backlog.md said the SCM's stop
+# "is not delivered to a Go process" — true of a console binary the SCM merely launches, and false
+# of one that answers the SCM. A Scheduled Task remains unusable for a different, measured reason:
+# a SYSTEM task runs in session 0 and its console cannot be attached from an interactive session,
+# so CTRL_C_EVENT can never reach it.
+
+$ServiceName = 'aispm-agent'
+
+function Get-AgentService {
+	Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+}
+
+# Stop-AgentService waits for the service to reach Stopped, and waits LONG.
+#
+# The agent's clean stop releases its in-target hooks with a two-minute budget of its own, because a
+# hook left live when the process disappears is reverted by Frida's teardown inside somebody else's
+# application and crashes it. So a stop that takes minutes is the system working, not hanging, and
+# anything here that gave up early and escalated would be the exact hard kill this whole arrangement
+# exists to avoid.
+function Stop-AgentService {
+	param([int]$TimeoutSeconds = 300)
+	$svc = Get-AgentService
+	if (-not $svc) { return $true }
+	if ($svc.Status -eq 'Stopped') { return $true }
+	Say "stopping the $ServiceName service (this takes minutes: it is releasing its in-target hooks)"
+	try { Stop-Service -Name $ServiceName -ErrorAction Stop } catch {
+		Warn "Stop-Service reported: $($_.Exception.Message)"
+	}
+	$deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+	while ((Get-Date) -lt $deadline) {
+		$svc = Get-AgentService
+		if (-not $svc -or $svc.Status -eq 'Stopped') { Say "stopped"; return $true }
+		Start-Sleep -Seconds 2
+	}
+	return $false
+}
+
+function Register-AgentService {
+	param([string]$BinPath, [string]$ConfigDir)
+	$existing = Get-AgentService
+	$binLine = '"{0}" -config "{1}"' -f $BinPath, $ConfigDir
+	if ($existing) {
+		Say "the $ServiceName service already exists; pointing it at this install"
+		# sc.exe rather than Set-Service: binPath= is not settable through Set-Service on PS 5.1.
+		& sc.exe config $ServiceName binPath= $binLine start= auto | Out-Null
+		if ($LASTEXITCODE -ne 0) { Die $EX_FAIL "could not reconfigure the $ServiceName service (sc config exited $LASTEXITCODE)" }
+	} else {
+		Say "registering the $ServiceName service (automatic start)"
+		& sc.exe create $ServiceName binPath= $binLine start= auto DisplayName= "AISPM host agent" | Out-Null
+		if ($LASTEXITCODE -ne 0) { Die $EX_FAIL "could not create the $ServiceName service (sc create exited $LASTEXITCODE)" }
+		& sc.exe description $ServiceName "Discovers AI usage on this host and reports it to the AISPM platform." | Out-Null
+	}
+
+	# Restart after a failure, three times, five seconds apart, counter reset after a day — the same
+	# shape as the systemd unit's Restart=on-failure/RestartSec=5.
+	& sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+	if ($LASTEXITCODE -ne 0) { Warn "could not set the service recovery actions (sc failure exited $LASTEXITCODE)" }
+
+	# AND make those actions apply to a NON-CRASH failure. Without this flag Windows treats an
+	# orderly stop with a non-zero exit code as a stop rather than a failure — so the agent's
+	# restart-after-update exit would be honoured by systemd and launchd and silently ignored here,
+	# leaving the host with a new binary and nothing running it. The agent also sets this itself at
+	# every service start, because a service somebody created by hand will not have it.
+	& sc.exe failureflag $ServiceName 1 | Out-Null
+	if ($LASTEXITCODE -ne 0) { Warn "could not make the recovery actions apply to a non-crash failure (sc failureflag exited $LASTEXITCODE): an automatic update may leave this host without a running agent" }
+}
+
+function Unregister-AgentService {
+	if (-not (Get-AgentService)) { return }
+	if (-not (Stop-AgentService)) {
+		Die $EX_FAIL "the $ServiceName service did not stop. Leave it to finish and re-run -Uninstall; do NOT kill it while it has applications instrumented."
+	}
+	Say "removing the $ServiceName service"
+	& sc.exe delete $ServiceName | Out-Null
+	if ($LASTEXITCODE -ne 0) { Warn "could not delete the $ServiceName service (sc delete exited $LASTEXITCODE); remove it with 'sc.exe delete $ServiceName'" }
+}
+
+# Read-BootstrapToken asks for the token in the console, hidden. It is what lets the one-liner
+# carry no secret: the token is typed, not pasted into a command the shell history keeps. Under
+# -NonInteractive, or in a host with no console, Read-Host throws — there is nobody to ask, and
+# that is a usage error, said as such. The SecureString round trip is the PS 5.1-compatible way to
+# hide input; ConvertFrom-SecureString -AsPlainText is 7+ only.
+function Read-BootstrapToken {
+	try {
+		$secure = Read-Host -Prompt 'Bootstrap token (from Agents Fleet -> Deploy agent, or POST /aispm/api/v1/agent/admin/bootstrap-tokens; input hidden)' -AsSecureString
+	} catch {
+		Die $EX_USAGE "no bootstrap token: pass -Token or -TokenFile, or run from an interactive console to be asked for it ($($_.Exception.Message))"
+	}
+	$bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
+	try { $plain = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+	finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+	if (-not $plain -or -not $plain.Trim()) { Die $EX_USAGE "empty bootstrap token" }
+	return $plain.Trim()
+}
+
 # TLS 1.2 floor: PS 5.1 still defaults to SSL3/TLS1 on older images, which no platform accepts.
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
+
+# ------------------------------------------------------------------- uninstall
+if ($Uninstall) {
+	if (-not $InstallDir) { $InstallDir = $InstallRootDefault }
+	$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+	if (-not (New-Object Security.Principal.WindowsPrincipal($id)).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+		Die $EX_PRIVILEGE "uninstalling needs Administrator ($InstallDir and its ACLs are not yours to remove otherwise): re-open PowerShell with 'Run as administrator'"
+	}
+
+	Step "Stopping the agent"
+	# The service first, if there is one: it owns the process, so stopping the process without
+	# removing the service would simply have it started again by the recovery action.
+	Unregister-AgentService
+
+	# Then any agent running from THIS install outside the service: matched by the executable it
+	# runs from, not by its name.
+	# A host can hold a second install (a staging copy, a developer build) and taking that one down
+	# — or refusing to proceed because of it — would be acting on a process nobody asked about.
+	$agentPath = Join-Path $InstallDir $AgentBin
+	$agent = @(Get-Process -Name 'aispm-agent' -ErrorAction SilentlyContinue |
+		Where-Object { $_.Path -and ($_.Path -ieq $agentPath) })
+	if ($agent.Count -eq 0) {
+		Say "no running agent found"
+	} else {
+		# Graceful only. A hard kill skips the pending-transaction flush AND can make Frida revert
+		# hooks inside a still-hooked LIVE application, crashing it — so this never escalates on the
+		# operator's behalf. If the graceful path is unavailable, it says so and stops.
+		$stopper = Join-Path $InstallDir $StopScriptName
+		if (Test-Path -LiteralPath $stopper) {
+			foreach ($p in $agent) {
+				Say "signalling pid $($p.Id) through $StopScriptName"
+				& powershell -NoProfile -ExecutionPolicy Bypass -File $stopper -ProcessId $p.Id
+			}
+		} else {
+			Die $EX_FAIL ("the agent is running (pid " + ($agent.Id -join ', ') + ") and $stopper is not here to stop it gracefully. Press Ctrl+C in the agent's own console, then re-run -Uninstall. Do NOT 'Stop-Process -Force' while it has applications instrumented.")
+		}
+		Start-Sleep -Seconds 2
+		$still = @(Get-Process -Name 'aispm-agent' -ErrorAction SilentlyContinue |
+			Where-Object { $_.Path -and ($_.Path -ieq $agentPath) })
+		if ($still.Count -gt 0) {
+			Die $EX_FAIL ("the agent is still running (pid " + ($still.Id -join ', ') + "). Leave it to finish and re-run -Uninstall.")
+		}
+		Say "stopped"
+	}
+
+	Step "Removing $InstallDir"
+	if (Test-Path -LiteralPath $InstallDir) {
+		# Refuse a path that is obviously not an install root rather than recursing into it.
+		$resolved = (Resolve-Path -LiteralPath $InstallDir).Path.TrimEnd('\')
+		$guarded = @($env:SystemRoot, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData,
+			$env:SystemDrive + '\', $env:SystemDrive + '\Users') | Where-Object { $_ }
+		foreach ($g in $guarded) {
+			if ($resolved -eq $g.TrimEnd('\')) { Die $EX_USAGE "-InstallDir '$InstallDir' is a system directory; refusing to delete it" }
+		}
+		# The injector staging directory can outlive the agent, and that is not a fault.
+		#
+		# Frida stages the library it asks each target to load under the install root, and the target
+		# keeps it MAPPED for its own lifetime — hooks are eternalised rather than reverted, because
+		# reverting one inside a live application crashes it. So while an instrumented application is
+		# still running, frida-agent.dll cannot be deleted and `Remove-Item -Recurse` fails partway,
+		# leaving the install root half gone with no explanation.
+		#
+		# Everything else is removed, and what is left is named along with the reason and the remedy:
+		# it disappears on its own when those applications exit or the host reboots.
+		Remove-Item -Recurse -Force -LiteralPath $InstallDir -ErrorAction SilentlyContinue
+		if (Test-Path -LiteralPath $InstallDir) {
+			$stuck = @(Get-ChildItem -LiteralPath $InstallDir -Recurse -File -ErrorAction SilentlyContinue)
+			$dll = @($stuck | Where-Object { $_.Name -like 'frida-agent*' })
+			if ($dll.Count -gt 0) {
+				Say "removed, except the injected library still mapped by instrumented applications:"
+				foreach ($f in $dll) { Say "  $($f.FullName)" }
+				Say "that is expected: those applications keep it loaded until they exit. It goes on its own"
+				Say "when they do, or at the next reboot. Nothing needs to be done about it."
+			} else {
+				Warn "$InstallDir could not be fully removed; what is left:"
+				foreach ($f in $stuck | Select-Object -First 10) { Warn "  $($f.FullName)" }
+			}
+		} else {
+			Say "removed"
+		}
+	} else {
+		Say "$InstallDir does not exist"
+	}
+
+	Write-Host ""
+	Write-Host "==> Uninstalled: the agent is stopped and $InstallDir is gone."
+	Write-Host ""
+	Write-Host "  ONE STEP IS LEFT, and it is not on this host: revoke this agent in the console"
+	Write-Host "  (Agents Fleet -> the agent's row -> Revoke key, or Forget it to drop its history too)."
+	Write-Host ""
+	Write-Host "  Deleting the files did NOT invalidate its credential. Until you revoke it, anything"
+	Write-Host "  holding a copy of the credential.json that was in $InstallDir\config can keep"
+	Write-Host "  reporting as this host."
+	Write-Host ""
+	exit $EX_OK
+}
 
 # ---------------------------------------------------------------- package mode
 $here = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
@@ -79,6 +296,7 @@ if (Test-Path -LiteralPath $confPath) {
 }
 $packagedToken = Join-Path $here 'bootstrap.token'
 if (-not $Token -and -not $TokenFile -and (Test-Path -LiteralPath $packagedToken)) { $TokenFile = $packagedToken }
+if (-not $Token -and -not $TokenFile) { $Token = Read-BootstrapToken }
 
 if (-not $Channel) { $Channel = $DefaultChannel }
 if (-not $InstallDir) { $InstallDir = $InstallRootDefault }
@@ -207,6 +425,34 @@ Step "Preparing $InstallDir"
 $configDir = Join-Path $InstallDir 'config'
 $logsDir = Join-Path $InstallDir 'logs'
 foreach ($d in @($InstallDir, $configDir, $logsDir)) { New-Item -ItemType Directory -Force -Path $d | Out-Null }
+
+# Lock the install tree down to Administrators and SYSTEM, and stop inheriting from the drive.
+#
+# Measured on a fleet host 2026-10-21: agent.yaml, config\credential.json AND logs\http.jsonl were
+# all readable by BUILTIN\Users and NT AUTHORITY\Authenticated Users, because the directories
+# inherited C:\'s ACL. credential.json holds the agent's API key to the platform, and http.jsonl
+# held thousands of third-party session tokens in clear - 8 079 lines on that host alone. Any
+# local user could read both.
+#
+# Well-known SIDs, not names: "BUILTIN\Administrators" is localised (Administrateurs, Administratoren)
+# and a name-based rule silently matches nothing on a non-English Windows - which would leave the
+# tree wide open while the installer reported success.
+$acl = Get-Acl -Path $InstallDir
+$acl.SetAccessRuleProtection($true, $false)   # break inheritance, drop the inherited entries
+foreach ($r in @($acl.Access)) { [void]$acl.RemoveAccessRule($r) }
+foreach ($sid in @('S-1-5-32-544', 'S-1-5-18')) {   # Administrators, LOCAL SYSTEM
+	$id = New-Object System.Security.Principal.SecurityIdentifier($sid)
+	$acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+		$id, 'FullControl', 'ContainerInherit,ObjectInherit', 'None', 'Allow')))
+}
+try {
+	Set-Acl -Path $InstallDir -AclObject $acl
+	Say "restricted $InstallDir to Administrators and SYSTEM"
+} catch {
+	# Not fatal: the agent runs and captures. But it must be said, because the failure is
+	# invisible otherwise and leaves credentials readable by every local user.
+	Warn "could not restrict the permissions of ${InstallDir}: $($_.Exception.Message) - the agent's credential and logs stay readable by local users"
+}
 # The config dir stays writable for the agent itself: credential.json, host.json, the identity
 # salt and the keylog cache all live there.
 New-Item -ItemType File -Force -Path (Join-Path $configDir $IncompleteMarker) | Out-Null
@@ -228,11 +474,77 @@ try {
 	}
 
 	# --------------------------------------------------------------- 5. binary + config
+	# An UPGRADE is a re-run of this installer on a host that already has an agent, and on Windows a
+	# running .exe cannot be replaced. Measured on WIN11 (.106, 2026-10-12) against a process proven
+	# to be holding the image: `Move-Item -Force` fails with "Cannot create a file when that file
+	# already exists" — it deletes then renames, and the delete is what the running image refuses, so
+	# the error names the leftover destination rather than the sharing violation underneath. Caught
+	# here, BEFORE the download, so a re-run on a live host fails in two seconds with something to act
+	# on rather than after ~190 MB.
+	#
+	# Renaming the old .exe ASIDE does work (measured in the same run), and it would let the install
+	# complete. It is deliberately not done: the running agent would keep executing the old image with
+	# nothing saying so, which is the failure this same change fixed on Linux, where `systemctl start`
+	# was a no-op on a live unit while the installer printed "started". A host silently reporting its
+	# previous version is worse than an install that stops and says why. It would also leave a ~190 MB
+	# stale binary behind on every upgrade.
+	#
+	# It refuses instead of stopping the agent, for the reason -Uninstall refuses: the graceful stop
+	# needs the agent's own console, this installer does not have it, and a hard kill can crash the
+	# applications the agent had instrumented. Whoever owns that console decides.
+	#
+	# A SERVICE changes this, and it is the main practical gain of the service mode: the SCM has a
+	# clean stop this installer can ask for and wait on, so an upgrade stops the service, replaces
+	# the binary and starts it again. The refusal below now applies only to a console agent, whose
+	# graceful stop needs its own console — which this installer does not have.
+	$existingService = Get-AgentService
+	$svcWasRunning = $false
+	if ($existingService -and $existingService.Status -ne 'Stopped') {
+		$svcWasRunning = $true
+		Step "Stopping the $ServiceName service to replace its binary"
+		if (-not (Stop-AgentService)) {
+			Die $EX_FAIL "the $ServiceName service did not stop, so its .exe cannot be replaced. Leave it to finish and re-run this installer; do NOT kill it while it has applications instrumented."
+		}
+	}
+
+	$runningHere = @(Get-Process -Name 'aispm-agent' -ErrorAction SilentlyContinue |
+		Where-Object { $_.Path -and ($_.Path -ieq (Join-Path $InstallDir $AgentBin)) })
+	if ($runningHere.Count -gt 0) {
+		$stopHint = Join-Path $InstallDir $StopScriptName
+		$how = if (Test-Path -LiteralPath $stopHint) { "powershell -ExecutionPolicy Bypass -File '$stopHint'" } else { "Ctrl+C in its console" }
+		Die $EX_FAIL ("an agent from $InstallDir is already running (pid " + ($runningHere.Id -join ', ') +
+			"), and Windows will not let its .exe be replaced while it runs. Stop it CLEANLY first ($how), " +
+			"then re-run this installer. Never 'Stop-Process -Force': it can crash the applications it instrumented.")
+	}
+
 	Step "Downloading the agent"
 	$binTmp = Join-Path $tmp $AgentBin
 	Get-Verified $artifact.url $artifact.sha256 $binTmp "the agent binary"
 	Move-Item -Force -LiteralPath $binTmp -Destination (Join-Path $InstallDir $AgentBin)
 	Say "installed $InstallDir\$AgentBin (sha256 verified)"
+
+	# The graceful stop belongs on the host: the closing instructions name it, and a hard kill is not
+	# an acceptable substitute — it skips the pending-transaction flush AND can make Frida revert
+	# hooks in a still-hooked LIVE target, crashing it (docs/frida-detach-crash.md). Never fatal: a
+	# release published before tools existed still installs, and the fallback (Ctrl+C in the agent's
+	# own console) is printed at the end either way.
+	$stopScriptPath = $null
+	if ($manifest.PSObject.Properties['tools'] -and $manifest.tools -and
+			$manifest.tools.PSObject.Properties[$StopScriptName]) {
+		$tool = $manifest.tools.$StopScriptName
+		if ($tool.url -and $tool.sha256) {
+			Step "Installing the graceful-stop script"
+			$toolTmp = Join-Path $tmp $StopScriptName
+			Get-Verified $tool.url $tool.sha256 $toolTmp "the graceful-stop script"
+			$stopScriptPath = Join-Path $InstallDir $StopScriptName
+			Move-Item -Force -LiteralPath $toolTmp -Destination $stopScriptPath
+			Say "installed $stopScriptPath (sha256 verified)"
+		} else {
+			Warn "release $Version lists $StopScriptName without a url or sha256; stopping the agent will rely on Ctrl+C in its own console"
+		}
+	} else {
+		Warn "release $Version publishes no $StopScriptName; stopping the agent will rely on Ctrl+C in its own console"
+	}
 
 	Step "Installing the configuration"
 	$cfgTmp = Join-Path $tmp 'config.tar.gz'
@@ -319,11 +631,18 @@ try {
 	}
 
 	Step "Enrolling agent $Version with $PlatformUrl"
+	# Same reason as the configuration fetch below: from PowerShell 7.4 a non-zero native exit throws
+	# while the preference is Stop. A throw here would replace the exit code and its remediation text
+	# with a PowerShell error, so the operator would learn that something failed but not which of the
+	# four enrollment faults it was.
+	$prevEap = $ErrorActionPreference
+	$ErrorActionPreference = 'Continue'
 	& (Join-Path $InstallDir $AgentBin) -enroll-only -config $configDir
 	$enrollCode = $LASTEXITCODE
+	$ErrorActionPreference = $prevEap
 	if ($enrollCode -ne 0) {
 		switch ($enrollCode) {
-			10 { Write-Host "`nThe bootstrap token was rejected. Issue a new one from Agents Fleet -> Deploy agent and re-run this installer; tokens are single-use and short-lived." }
+			10 { Write-Host "`nThe bootstrap token was rejected. Issue a new one from Agents Fleet -> Deploy agent (or POST $PlatformUrl/aispm/api/v1/agent/admin/bootstrap-tokens with a tenant API key carrying agent:manage) and re-run this installer; tokens are single-use and short-lived." }
 			11 { Write-Host "`nThe agent could not reach $PlatformUrl even though this installer could. Check egress rules and TLS trust for the agent's own process, and HTTPS_PROXY if this host needs a proxy." }
 			12 { Write-Host "`nThe agent rejected its configuration. Check platform.url and platform.bootstrap_token_file in $configDir\agent.yaml." }
 			13 { Write-Host "`nThe platform answered but cannot enrol this host - usually its agent signing keys are not provisioned yet. Ask the platform administrator, then re-run this installer." }
@@ -331,15 +650,101 @@ try {
 		exit $enrollCode
 	}
 
+	# ------------------------------------------------ 7c. fetch the published configuration
+	# The catalogues this installer shipped are a FLOOR, not the answer: the platform is the authority
+	# on which applications are known and how they are identified, and a host installed today would
+	# otherwise run last release's catalogue until its own pull loop came round. Fetching here closes
+	# that window, and it is the one moment where putting a configuration into effect costs nothing -
+	# no agent is running, so nothing is swapped out from under a reader.
+	#
+	# Deliberately NEVER fatal. Every failure leaves the installer's catalogues in effect, which is a
+	# supported way to run, and the agent retries on its own. Only a REFUSED manifest (22) and a
+	# configuration fault (12) are worth a word to the operator.
+	Step "Fetching the configuration the platform publishes"
+	# ErrorActionPreference is lifted around the call, and must stay lifted. From PowerShell 7.4 a
+	# native command exiting non-zero THROWS while the preference is Stop, and here a non-zero exit is
+	# the ordinary case - "nothing is published yet" is code 20 - so leaving it in place would abort a
+	# perfectly good installation on the most common outcome of all.
+	$prevEap = $ErrorActionPreference
+	$ErrorActionPreference = 'Continue'
+	& (Join-Path $InstallDir $AgentBin) -config-fetch-only -config $configDir
+	$cfgCode = $LASTEXITCODE
+	$ErrorActionPreference = $prevEap
+	switch ($cfgCode) {
+		0  { }
+		20 { Say "nothing is published for this agent yet - the catalogues this installer shipped are in effect" }
+		21 { Say "the platform did not answer - the catalogues this installer shipped are in effect; the agent fetches again on its own once it is running" }
+		22 { Warn "the platform published a configuration this agent REFUSED (see the reason above). The catalogues this installer shipped are in effect. This is a fault in what was published, not on this host: report it to the platform administrator." }
+		default { Warn "the configuration fetch reported code $cfgCode; the catalogues this installer shipped are in effect" }
+	}
+
 	Remove-Item -Force -LiteralPath (Join-Path $configDir $IncompleteMarker) -ErrorAction SilentlyContinue
 
-	# ------------------------------------------------------------------ 8. how to run
+	# ------------------------------------------------------------------ 8. service, or how to run
+	#
+	# Which arrangement: -Service asks for one, -NoService refuses one, and an install on a host
+	# that ALREADY has the service keeps it — an upgrade must not silently demote a supervised host
+	# to a console one, which would leave it dead after its next reboot.
+	$useService = $false
+	if ($Service -and $NoService) { Die $EX_USAGE "-Service and -NoService contradict each other" }
+	if ($Service) { $useService = $true }
+	elseif ($NoService) { $useService = $false }
+	elseif ($existingService) { $useService = $true }
+
+	$agentPathFinal = Join-Path $InstallDir $AgentBin
+	if ($useService) {
+		Step "Registering the service"
+		Register-AgentService -BinPath $agentPathFinal -ConfigDir $configDir
+		Say "starting the $ServiceName service"
+		try { Start-Service -Name $ServiceName -ErrorAction Stop } catch {
+			Die $EX_FAIL "the $ServiceName service was registered but would not start: $($_.Exception.Message). Check $logsDir\agent.log."
+		}
+		# Started is not running: the agent reports StartPending while it reads its configuration,
+		# identifies the host and runs its preflight, and only reports Running once that passed. So
+		# a service that reaches Running is one whose preflight passed, which is worth waiting for.
+		$deadline = (Get-Date).AddSeconds(90)
+		$ok = $false
+		while ((Get-Date) -lt $deadline) {
+			$svc = Get-AgentService
+			if ($svc -and $svc.Status -eq 'Running') { $ok = $true; break }
+			if ($svc -and $svc.Status -eq 'Stopped') { break }
+			Start-Sleep -Seconds 2
+		}
+		if ($ok) { Say "the service is running" }
+		else { Warn "the $ServiceName service did not report Running within 90s - check $logsDir\agent.log and 'Get-Service $ServiceName'" }
+	} elseif ($svcWasRunning) {
+		# The service existed, was stopped to replace the binary, and -NoService was asked for.
+		# Starting it again would contradict the request; leaving it registered and stopped would
+		# leave a host that looks supervised and is not. Said out loud rather than decided quietly.
+		Warn "the $ServiceName service is registered but was NOT restarted, because -NoService was passed. Either start it (Start-Service $ServiceName) or remove it (sc.exe delete $ServiceName)."
+	}
+
 	Write-Host ""
 	Write-Host "==> Installed: aispm-agent $Version in $InstallDir"
 	Write-Host ""
+	if ($useService) {
+		Write-Host "It runs as the Windows service '$ServiceName', starts automatically at boot, and is"
+		Write-Host "restarted by Windows if it fails - which is also what lets it install its own updates."
+		Write-Host ""
+		Write-Host "  Status:  Get-Service $ServiceName"
+		Write-Host "  Stop:    Stop-Service $ServiceName      (takes MINUTES: it releases its in-target"
+		Write-Host "                                           hooks first, and that is the system working)"
+		Write-Host "  Start:   Start-Service $ServiceName"
+		Write-Host ""
+		Write-Host "  NEVER 'Stop-Process -Force' / taskkill /F on it. A hard kill can crash or freeze the"
+		Write-Host "  applications the agent was monitoring. Stop-Service is the clean way and always works."
+		Write-Host ""
+		Write-Host "Logs:   $logsDir"
+		Write-Host "Config: $configDir   (agent.yaml, catalogues, credential.json)"
+		exit $EX_OK
+	}
 	Write-Host "Start the agent (elevated PowerShell):"
 	Write-Host ""
 	Write-Host "  & '$InstallDir\$AgentBin' -config '$configDir'"
+	Write-Host ""
+	Write-Host "  (Or re-run this installer with -Service to have Windows start it at boot and keep it"
+	Write-Host "   running. A console agent does not survive a reboot and cannot install its own updates:"
+	Write-Host "   nothing would restart it afterwards.)"
 	Write-Host ""
 	Write-Host "  (The log destination is already set in $configDir\agent.yaml - $logsDir\agent.log,"
 	Write-Host "   appended to rather than truncated, and size-bounded by rotation (logging.max_size_mb,"
@@ -347,7 +752,14 @@ try {
 	Write-Host ""
 	Write-Host "Stop it CLEANLY - Ctrl+C in its console, or:"
 	Write-Host ""
-	Write-Host "  .\stop-agent-graceful.ps1 -ProcessId <pid>"
+	if ($stopScriptPath) {
+		Write-Host "  powershell -ExecutionPolicy Bypass -File '$stopScriptPath'"
+		Write-Host ""
+		Write-Host "  (It finds the single running agent on its own; pass -ProcessId <pid> if several run.)"
+	} else {
+		Write-Host "  Ctrl+C is the only graceful stop on this host: this release published no"
+		Write-Host "  $StopScriptName. Start the agent in a console you keep, so you have one."
+	}
 	Write-Host ""
 	Write-Host "  NEVER 'Stop-Process -Force' / taskkill /F. A hard kill can crash or freeze the"
 	Write-Host "  applications the agent was monitoring, and loses whatever it had not yet reported."
