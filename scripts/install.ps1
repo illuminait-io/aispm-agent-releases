@@ -19,12 +19,40 @@
   the binary and the configuration for the resolved release (SHA256 verified), gates on the agent's
   own preflight, enrols the host, and prints the exact command to run it.
 
-  -Service registers the agent as a Windows service (automatic start, restart on failure) instead of
-  leaving you a command to run. That is what a host nobody will log into again needs: a console agent
-  does not survive a reboot, and it cannot be restarted after an automatic update. The service is
-  stoppable cleanly (Stop-Service), which a Scheduled Task is not — the agent implements the service
-  control handler, so the SCM's Stop reaches its shutdown path and its in-target hooks are released
-  properly. -NoService forces the console arrangement.
+  A WINDOWS SERVICE IS THE DEFAULT, and -Console is how you ask for the other thing.
+
+  The default is the arrangement a real host needs, so it is the one you get without choosing: the
+  service starts at boot, the SCM restarts it after a failure, and Stop-Service is a clean stop the
+  agent handles itself (it implements the service control handler, so the SCM's Stop reaches its
+  shutdown path and its in-target hooks are released properly — which a Scheduled Task cannot do).
+  A console agent does not survive a reboot and cannot be restarted after an automatic update, so it
+  was never the right default: an installer whose easiest path leaves an agent that dies at the next
+  reboot is an installer that produces dead hosts.
+
+  -Console installs the files, enrols the host and prints the command to run, registering no service.
+  For a laptop you are debugging on, a container, or a host where you want the agent in the
+  foreground. On a host that already has the service, -Console REMOVES it rather than leaving both:
+  only one agent may run at a time (two would stack hooks on the same target and crash it), so a
+  service and a console command for the same host is not a choice, it is a trap.
+
+  -Service and -NoService are still accepted, undocumented, so the one-liners and scripts already in
+  the field keep working: -Service now asserts the default and -NoService means -Console. Prefer
+  -Console in anything new.
+
+  THE PREREQUISITES BLOCK A FIRST INSTALL AND NEVER BLOCK AN UPGRADE.
+
+  On a host the platform does not know yet, a failed check stops the installation: nothing is
+  deployed, an operator is reading the output, and the cheapest moment to refuse a host is before it
+  holds a credential. -Force installs anyway and makes the listed consequences this host's.
+
+  On a host that already runs an agent (an enrolled credential, or a registered service) a failed
+  check NEVER stops the installation. Refusing would leave the OLD binary in place over a condition
+  the new one handles by degrading — it narrows what it does, keeps reporting, and says `degraded` on
+  every heartbeat — and on a host nobody is watching, a blocked upgrade is an invisible non-event.
+
+  Either way the failed checks, their consequence and their remediation are printed AND written to
+  logs\install-preflight.log, because the one outcome that must never happen is a host left in a
+  state nobody can explain later.
 
   -Uninstall stops the agent gracefully and deletes the install directory, removing the service first
   if there is one. It needs no token and no -PlatformUrl. Revoke the agent's key in the console
@@ -51,6 +79,12 @@ param(
 	[string]$InstallDir,
 	[switch]$ReEnroll,
 	[switch]$Uninstall,
+	[switch]$Console,
+	[switch]$Force,
+	# Compatibility, deliberately undocumented: -Service asserts what is now the default and
+	# -NoService is -Console. Kept because removing a switch does not deprecate it, it makes every
+	# invocation that carries it die on "A parameter cannot be found" — which is exactly how a stale
+	# vendored copy of this script broke `install.cmd -Service` in the field once already.
 	[switch]$Service,
 	[switch]$NoService
 )
@@ -139,9 +173,17 @@ function Register-AgentService {
 		& sc.exe description $ServiceName "Discovers AI usage on this host and reports it to the AISPM platform." | Out-Null
 	}
 
-	# Restart after a failure, three times, five seconds apart, counter reset after a day — the same
-	# shape as the systemd unit's Restart=on-failure/RestartSec=5.
-	& sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/5000/restart/5000 | Out-Null
+	# Restart after a failure, with BACKOFF: 5 seconds, then 30, then every 5 minutes, counter reset
+	# after a day. Must stay identical to ensureServiceRecovery in cmd/aispm-agent/service_windows.go,
+	# which re-applies it at every service start — two different policies here would mean the host
+	# behaved differently before and after its first successful start.
+	#
+	# It was three restarts five seconds apart, which capped nothing: the SCM repeats the LAST action
+	# for every subsequent failure inside the reset period, so a host that could not start restarted
+	# 10 965 times in nineteen hours and wrote ~85 MB of log onto the volume whose fullness was the
+	# problem. Backoff and not a cap, because a supervisor that gives up leaves a host with no agent
+	# and no way to say so.
+	& sc.exe failure $ServiceName reset= 86400 actions= restart/5000/restart/30000/restart/300000 | Out-Null
 	if ($LASTEXITCODE -ne 0) { Warn "could not set the service recovery actions (sc failure exited $LASTEXITCODE)" }
 
 	# AND make those actions apply to a NON-CRASH failure. Without this flag Windows treats an
@@ -302,6 +344,14 @@ if (-not $Channel) { $Channel = $DefaultChannel }
 if (-not $InstallDir) { $InstallDir = $InstallRootDefault }
 if (-not $PlatformUrl) { Die $EX_USAGE "-PlatformUrl is required (or provide installer.conf next to this script)" }
 if ($PlatformUrl -notmatch '^https://') { Die $EX_USAGE "-PlatformUrl must be an https URL, got '$PlatformUrl'" }
+
+# Contradictory switches are refused HERE, with the other argument validation, and not where the
+# arrangement is decided: that happens at step 8, after ~190 MB has been downloaded and the host has
+# enrolled. Spending all of that to then reject the command line is the wrong order, and the longer
+# the switch list grows the likelier somebody is to find out the slow way.
+if ($Service -and ($Console -or $NoService)) {
+	Die $EX_USAGE "-Service contradicts -Console: a service is the default, so pass neither to get one"
+}
 $PlatformUrl = $PlatformUrl.TrimEnd('/')
 
 # --------------------------------------------------------------- 1. os / arch
@@ -617,6 +667,14 @@ try {
 
 	# --------------------------------------------------------------- 7. preflight + enroll
 	$credPath = Join-Path $configDir 'credential.json'
+
+	# IS THIS A FIRST INSTALL OR AN UPGRADE? The question decides whether a failed prerequisite
+	# blocks, so it is answered BEFORE -ReEnroll discards the credential below — otherwise
+	# re-enrolling a long-deployed host would make it look brand new and could block an upgrade.
+	#
+	# An enrolled credential, or a registered service, means the platform already knows this host.
+	$isUpgrade = (Test-Path -LiteralPath $credPath) -or [bool]$existingService
+
 	if ($ReEnroll -and (Test-Path -LiteralPath $credPath)) {
 		Say "-ReEnroll: discarding the stored credential (the platform revokes its key on the next enrollment)"
 		Remove-Item -Force -LiteralPath $credPath
@@ -625,9 +683,58 @@ try {
 	Step "Running the agent's preflight"
 	# -preflight-save also persists host.json, which the enrollment below reads to record the
 	# cloud environment. Without it every agent would enrol as on-premise.
-	& (Join-Path $InstallDir $AgentBin) -preflight-save -config $configDir
-	if ($LASTEXITCODE -ne 0) {
-		Die $EX_PREFLIGHT "the agent's preflight refused this host (see the failed checks and their remediation above)"
+	#
+	# DISPLAYED AND LOGGED, both, always — whatever the verdict and whatever happens next. The
+	# checks carry their own consequence and remediation, and the one thing that must never happen
+	# is for a host to be left in a state nobody can explain afterwards. The console copy is for the
+	# operator standing here; the file is for whoever reads this host in a month.
+	$preflightLog = Join-Path $logsDir 'install-preflight.log'
+	# Appended, with a header, so an upgrade does not erase the verdict of the install before it:
+	# "this host was already short of disk when it was first deployed" is the kind of thing only a
+	# kept record can say. Installs are rare, so the file stays small.
+	$stamp = (Get-Date).ToString('yyyy-MM-ddTHH:mm:ssK')
+	$kind = 'first install'
+	$gate = 'a failed check BLOCKS'
+	if ($isUpgrade) {
+		$kind = 'upgrade'
+		$gate = 'a failed check does NOT block'
+	}
+	if ($Force) { $gate = '-Force: a failed check does NOT block' }
+	Add-Content -LiteralPath $preflightLog -Encoding UTF8 -Value ""
+	Add-Content -LiteralPath $preflightLog -Encoding UTF8 -Value "=== $stamp - $kind of $Version - $gate ==="
+	$prevEap = $ErrorActionPreference
+	$ErrorActionPreference = 'Continue' # a native non-zero exit throws under Stop from PS 7.4
+	& (Join-Path $InstallDir $AgentBin) -preflight-save -config $configDir 2>&1 |
+		Tee-Object -FilePath $preflightLog -Append
+	$preflightCode = $LASTEXITCODE
+	$ErrorActionPreference = $prevEap
+	Say "the preflight verdict was written to $preflightLog"
+
+	if ($preflightCode -ne 0) {
+		# WHO BLOCKS AND WHO DOES NOT, and the asymmetry is the whole point.
+		#
+		#   first install   BLOCKS. Nothing is deployed yet, an operator is reading this output, and
+		#                   the cheapest moment to refuse a host is before it holds a credential.
+		#   upgrade         NEVER BLOCKS. The host already runs an agent; refusing the new binary
+		#                   would leave the old one in place over a condition the new one handles by
+		#                   degrading (see internal/agent/degraded.go) — and on a host nobody is
+		#                   watching, a blocked upgrade is an invisible non-event.
+		#   -Force          BLOCKS NOTHING, on an operator's explicit say-so.
+		#
+		# In every branch the failed checks have already been shown and written above.
+		if ($isUpgrade) {
+			Warn "the agent's preflight did not pass, and this is an UPGRADE, so the installation continues: the host already runs an agent, and the new one reports a degraded state rather than refusing to start. Fix the conditions above - see $preflightLog."
+		}
+		elseif ($Force) {
+			Warn "the agent's preflight did not pass, and -Force was given, so the installation continues. The consequences listed above are now this host's: an agent may run degraded, or not at all. See $preflightLog."
+		}
+		else {
+			Write-Host ""
+			Write-Host "The checks above did not pass, and this is a FIRST installation on this host." -ForegroundColor Yellow
+			Write-Host "Fix the conditions listed with each failed check, then re-run this installer." -ForegroundColor Yellow
+			Write-Host "To install anyway and accept the consequences above, add -Force." -ForegroundColor Yellow
+			Die $EX_PREFLIGHT "the agent's preflight refused this host (verdict in $preflightLog)"
+		}
 	}
 
 	Step "Enrolling agent $Version with $PlatformUrl"
@@ -682,14 +789,32 @@ try {
 
 	# ------------------------------------------------------------------ 8. service, or how to run
 	#
-	# Which arrangement: -Service asks for one, -NoService refuses one, and an install on a host
-	# that ALREADY has the service keeps it — an upgrade must not silently demote a supervised host
-	# to a console one, which would leave it dead after its next reboot.
-	$useService = $false
-	if ($Service -and $NoService) { Die $EX_USAGE "-Service and -NoService contradict each other" }
-	if ($Service) { $useService = $true }
-	elseif ($NoService) { $useService = $false }
-	elseif ($existingService) { $useService = $true }
+	# Which arrangement. A SERVICE IS THE DEFAULT: it is what a host nobody logs into again needs,
+	# and the old default (a console command unless -Service was passed) made the easiest path the
+	# one that leaves an agent dead at the next reboot.
+	#
+	# -Console is how you ask for the foreground agent; -NoService is its older spelling and -Service
+	# now asserts the default. The no-flag case needs no protection against demoting a supervised
+	# host, which the previous logic had to carry: the default IS the service.
+	# Already refused at argument-validation time, far above, before anything was downloaded.
+	$useService = -not ($Console -or $NoService)
+
+	# Say it when the arrangement CHANGES under an operator who did not ask for a change. Both
+	# directions are deliberate and neither may be silent: an upgrade promoting a console host is
+	# the point of this default, and a demotion must remove the service rather than leave both — only
+	# one agent may run at a time, and two would stack hooks on the same target and crash it.
+	if ($useService -and -not $existingService) {
+		Say "this host will run the agent as a service (the default); pass -Console for a foreground agent instead"
+	}
+	if (-not $useService -and $existingService) {
+		Step "Removing the service, because -Console asks for a foreground agent"
+		Say "a service AND a console command for one host is not a choice: only one agent may run at a time"
+		# Unregister-AgentService stops it first and refuses to delete a service that would not
+		# stop, so it is the whole gesture. Calling Stop-AgentService here too would also push its
+		# boolean return into the output stream.
+		Unregister-AgentService
+		$existingService = $null
+	}
 
 	$agentPathFinal = Join-Path $InstallDir $AgentBin
 	if ($useService) {
@@ -699,9 +824,16 @@ try {
 		try { Start-Service -Name $ServiceName -ErrorAction Stop } catch {
 			Die $EX_FAIL "the $ServiceName service was registered but would not start: $($_.Exception.Message). Check $logsDir\agent.log."
 		}
-		# Started is not running: the agent reports StartPending while it reads its configuration,
-		# identifies the host and runs its preflight, and only reports Running once that passed. So
-		# a service that reaches Running is one whose preflight passed, which is worth waiting for.
+		# Started is not running: the agent reports StartPending while it reads its configuration and
+		# identifies the host, and Running once it is actually up — which is worth waiting for.
+		#
+		# IT NO LONGER PROVES THE PREFLIGHT PASSED, and that used to be this comment's claim. The
+		# agent now DEGRADES on an unmet prerequisite instead of refusing to start (see
+		# internal/agent/degraded.go), so a host short of disk reaches Running and reports `degraded`
+		# on every beat. That is the intended outcome — an agent that reports is repairable, one that
+		# refused to start was invisible — and it is also why the installer gates on `-preflight-save`
+		# above rather than on this wait: that mode still exits non-zero on a failed check, which is
+		# where fail-fast belongs, with an operator reading the output.
 		$deadline = (Get-Date).AddSeconds(90)
 		$ok = $false
 		while ((Get-Date) -lt $deadline) {
@@ -713,15 +845,28 @@ try {
 		if ($ok) { Say "the service is running" }
 		else { Warn "the $ServiceName service did not report Running within 90s - check $logsDir\agent.log and 'Get-Service $ServiceName'" }
 	} elseif ($svcWasRunning) {
-		# The service existed, was stopped to replace the binary, and -NoService was asked for.
+		# The service existed, was stopped to replace the binary, and a console agent was asked for.
 		# Starting it again would contradict the request; leaving it registered and stopped would
 		# leave a host that looks supervised and is not. Said out loud rather than decided quietly.
-		Warn "the $ServiceName service is registered but was NOT restarted, because -NoService was passed. Either start it (Start-Service $ServiceName) or remove it (sc.exe delete $ServiceName)."
+		Warn "the $ServiceName service is registered but was NOT restarted, because -Console was passed. Either start it (Start-Service $ServiceName) or remove it (sc.exe delete $ServiceName)."
 	}
 
 	Write-Host ""
 	Write-Host "==> Installed: aispm-agent $Version in $InstallDir"
 	Write-Host ""
+
+	# THE UNMET CONDITION IS REPEATED HERE, at the end, and that is the point of saying it twice.
+	# The failed checks scrolled past several steps ago, between a download and an enrollment; an
+	# operator who reads only the last screen would otherwise take "Installed" for "healthy". The
+	# agent runs, and it runs narrowed - both halves belong in the verdict.
+	if ($preflightCode -ne 0) {
+		Write-Host "  DEGRADED: a host prerequisite was not met, so this agent will run with less than" -ForegroundColor Yellow
+		Write-Host "  its full function and will report 'degraded' on every heartbeat. It re-tests the" -ForegroundColor Yellow
+		Write-Host "  condition every 5 minutes and recovers on its own once it is fixed - no reinstall." -ForegroundColor Yellow
+		Write-Host "  What failed, with its consequence and remedy: $preflightLog" -ForegroundColor Yellow
+		Write-Host ""
+	}
+
 	if ($useService) {
 		Write-Host "It runs as the Windows service '$ServiceName', starts automatically at boot, and is"
 		Write-Host "restarted by Windows if it fails - which is also what lets it install its own updates."
@@ -742,13 +887,13 @@ try {
 	Write-Host ""
 	Write-Host "  & '$InstallDir\$AgentBin' -config '$configDir'"
 	Write-Host ""
-	Write-Host "  (Or re-run this installer with -Service to have Windows start it at boot and keep it"
-	Write-Host "   running. A console agent does not survive a reboot and cannot install its own updates:"
-	Write-Host "   nothing would restart it afterwards.)"
+	Write-Host "  (Or re-run this installer WITHOUT -Console to have Windows start it at boot and keep"
+	Write-Host "   it running - that is the default. A console agent does not survive a reboot and cannot"
+	Write-Host "   install its own updates: nothing would restart it afterwards.)"
 	Write-Host ""
 	Write-Host "  (The log destination is already set in $configDir\agent.yaml - $logsDir\agent.log,"
 	Write-Host "   appended to rather than truncated, and size-bounded by rotation (logging.max_size_mb,"
-	Write-Host "   50 MiB; current file plus one rotated agent.log.1, so ~2x that on disk).)"
+	Write-Host "   25 MiB; current file plus one rotated agent.log.1, so ~2x that on disk).)"
 	Write-Host ""
 	Write-Host "Stop it CLEANLY - Ctrl+C in its console, or:"
 	Write-Host ""

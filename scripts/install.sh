@@ -66,7 +66,7 @@ MIN_FREE_MB="${AISPM_MIN_FREE_DISK_MB:-2048}"
 LAUNCHD_BOOTOUT_WAIT=35
 
 platform_url=""; token=""; token_file=""; version=""; channel=""; no_start=0; uninstall=0
-manifest_url=""; install_dir=""; re_enroll=0
+manifest_url=""; install_dir=""; re_enroll=0; force=0
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n==> %s\n' "$*"; }
@@ -87,6 +87,12 @@ Usage: install.sh [options]
   --manifest-url URL   resolve the release from this manifest, bypassing the channel
   --install-dir PATH   install root (default: /opt/IlluminaIT)
   --re-enroll          discard the stored credential and enrol again (needs a fresh token)
+  --force              install even though a prerequisite check failed, accepting the consequences
+                       each failed check states. Only a FIRST install is ever blocked by them: on a
+                       host that already runs an agent they never block, because refusing would
+                       leave the OLD binary in place over a condition the new one handles by
+                       degrading. Either way the failed checks are printed AND written to
+                       <install-dir>/logs/install-preflight.log
   --no-start           install, enrol and register the service, but do NOT start it. On macOS this
                        is what lets Full Disk Access be granted first: the grant is bound to the
                        BINARY's hash, and an agent started before it runs its whole session
@@ -112,6 +118,7 @@ while [ $# -gt 0 ]; do
 	--manifest-url) manifest_url="${2:-}"; shift 2 ;;
 	--install-dir)  install_dir="${2:-}"; shift 2 ;;
 	--re-enroll)    re_enroll=1; shift ;;
+	--force)        force=1; shift ;;
 	--no-start)     no_start=1; shift ;;
 	--uninstall)    uninstall=1; shift ;;
 	-h|--help)      usage; exit $EX_OK ;;
@@ -607,6 +614,20 @@ else
 fi
 
 # --------------------------------------------------------------- 7. preflight + enroll
+# IS THIS A FIRST INSTALL OR AN UPGRADE? The question decides whether a failed prerequisite blocks,
+# so it is answered BEFORE --re-enroll discards the credential below: re-enrolling a long-deployed
+# host must not make it look brand new and block its upgrade.
+#
+# An enrolled credential, or an installed service unit, means the platform already knows this host.
+is_upgrade=0
+if [ -f "$config_dir/credential.json" ]; then
+	is_upgrade=1
+elif [ -n "${SYSTEMD_UNIT:-}" ] && [ -f "/etc/systemd/system/$SYSTEMD_UNIT" ]; then
+	is_upgrade=1
+elif [ -f "$LAUNCHD_DIR/$LAUNCHD_LABEL.plist" ]; then
+	is_upgrade=1
+fi
+
 if [ "$re_enroll" -eq 1 ] && [ -f "$config_dir/credential.json" ]; then
 	say "  --re-enroll: discarding the stored credential (the platform revokes its key on the next enrollment)"
 	rm -f "$config_dir/credential.json"
@@ -615,11 +636,55 @@ fi
 step "Running the agent's preflight"
 # -preflight-save also persists host.json, which the enrollment below reads to record the cloud
 # environment. Without it every agent would enrol as on-premise.
+#
+# DISPLAYED AND LOGGED, both, always, whatever the verdict: the checks carry their own consequence
+# and remediation, and a host must never be left in a state nobody can explain afterwards. Appended,
+# so an upgrade does not erase the verdict of the install before it.
+preflight_log="$logs_dir/install-preflight.log"
+pf_kind="first install"; pf_gate="a failed check BLOCKS"
+if [ "$is_upgrade" -eq 1 ]; then pf_kind="upgrade"; pf_gate="a failed check does NOT block"; fi
+if [ "$force" -eq 1 ]; then pf_gate="--force: a failed check does NOT block"; fi
+{
+	printf '\n=== %s - %s of %s - %s ===\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$pf_kind" "$version" "$pf_gate"
+} >> "$preflight_log"
+
+# Captured to a file and then shown, rather than piped through tee: this script is /bin/sh and
+# POSIX has no PIPESTATUS, so a pipeline would cost the preflight's real exit code — the one value
+# the whole gate below turns on. The preflight is a handful of filesystem checks and one probe, so
+# nothing is lost by showing its output when it finishes instead of streaming it.
+pf_out="$tmp/preflight.out"
 set +e
-"$install_dir/$AGENT_BIN" -preflight-save -config "$config_dir"
+"$install_dir/$AGENT_BIN" -preflight-save -config "$config_dir" > "$pf_out" 2>&1
 pf_code=$?
 set -e
-[ "$pf_code" -eq 0 ] || die $EX_PREFLIGHT "the agent's preflight refused this host (see the failed checks and their remediation above)"
+cat "$pf_out"
+cat "$pf_out" >> "$preflight_log"
+say "  the preflight verdict was written to $preflight_log"
+
+if [ "$pf_code" -ne 0 ]; then
+	# WHO BLOCKS AND WHO DOES NOT, and the asymmetry is the whole point.
+	#
+	#   first install  BLOCKS. Nothing is deployed yet, an operator is reading this output, and the
+	#                  cheapest moment to refuse a host is before it holds a credential.
+	#   upgrade        NEVER BLOCKS. The host already runs an agent, and refusing the new binary
+	#                  would leave the OLD one in place over a condition the new one handles by
+	#                  degrading (internal/agent/degraded.go). On a host nobody is watching, a
+	#                  blocked upgrade is an invisible non-event.
+	#   --force        BLOCKS NOTHING, on an operator's explicit say-so.
+	#
+	# The failed checks have already been shown and written above in every branch.
+	if [ "$is_upgrade" -eq 1 ]; then
+		warn "the agent's preflight did not pass, and this is an UPGRADE, so the installation continues: the host already runs an agent, and the new one reports a degraded state rather than refusing to start. Fix the conditions above - see $preflight_log."
+	elif [ "$force" -eq 1 ]; then
+		warn "the agent's preflight did not pass, and --force was given, so the installation continues. The consequences listed above are now this host's. See $preflight_log."
+	else
+		say ""
+		say "The checks above did not pass, and this is a FIRST installation on this host."
+		say "Fix the conditions listed with each failed check, then re-run this installer."
+		say "To install anyway and accept the consequences above, add --force."
+		die $EX_PREFLIGHT "the agent's preflight refused this host (verdict in $preflight_log)"
+	fi
+fi
 
 step "Enrolling agent $version with $platform_url"
 set +e
