@@ -102,6 +102,21 @@ $ReleasesRepo = 'aispm-agent-releases'
 $DefaultChannel = 'stable'
 $InstallRootDefault = 'C:\IlluminaIT'
 $AgentBin = 'aispm-agent.exe'
+
+# HOW THIS INSTALLER IDENTIFIES ITSELF ON THE WIRE, and why it is not left to the default.
+#
+# Invoke-WebRequest's default User-Agent on PS 5.1 begins with "Mozilla/5.0", so anything that
+# decides what to serve by sniffing the UA treats this script as a person with a browser. An ngrok
+# free tunnel does exactly that: it answers a browser with an HTML interstitial - HTTP 200,
+# "You are about to visit ..." - instead of the JSON that was asked for. The installer then died on
+# `Invalid JSON primitive: You.`, a message that names nothing. Measured 2026-11-11 against a local
+# platform behind ngrok-free.dev (ERR_NGROK_6024); curl was never affected, so this was Windows only.
+#
+# A self-identifying agent is what should have been sent anyway - a platform's access log can now
+# tell an install from a browser - and it fixes the sniffing as a side effect. The ngrok header is
+# belt and braces: ngrok documents it, and any other host ignores a header it does not know.
+$PlatformUA = 'aispm-agent-installer (windows)'
+$PlatformHeaders = @{ 'ngrok-skip-browser-warning' = 'true' }
 # StopScriptName is both the manifest's tools key and the file's name on the host: the closing
 # instructions print its installed path, so the two must be the same string.
 $StopScriptName = 'stop-agent-graceful.ps1'
@@ -393,13 +408,30 @@ Step "Checking that the platform is reachable"
 $pingUrl = "$PlatformUrl$PingPath"
 $pingCode = 0
 try {
-	$resp = Invoke-WebRequest -Uri $pingUrl -UseBasicParsing -Method Get -TimeoutSec 15
+	$resp = Invoke-WebRequest -Uri $pingUrl -UseBasicParsing -Method Get -TimeoutSec 15 `
+		-UserAgent $PlatformUA -Headers $PlatformHeaders
 	$pingCode = [int]$resp.StatusCode
+	# A 200 MUST ALSO BE JSON, and the test is a whitelist rather than a blacklist on purpose.
+	#
+	# This is the one shape a status-code test cannot see: a tunnel's browser interstitial and a
+	# proxy's error page both answer 200 with a page, so the check passed something that was never
+	# the agent API. It was measured here: without the headers above, this endpoint answered
+	# `200 text/plain` from an ngrok free tunnel and the strict-200 test accepted it.
+	#
+	# text/plain, note - not text/html, which is what curl saw for the same response. So a blacklist
+	# of page-ish types would have missed it, as a first attempt at this did. The route serves
+	# `application/json` and has only ever served that, so requiring JSON is both narrower and the
+	# only form that cannot be fooled by whatever a middlebox decides to call its own page.
+	$pingType = ''
+	try { $pingType = [string]$resp.Headers['Content-Type'] } catch { }
+	if ($pingCode -eq 200 -and $pingType -notmatch 'json') { $pingCode = -1 }
 } catch {
 	if ($_.Exception.Response) { $pingCode = [int]$_.Exception.Response.StatusCode } else { $pingCode = 0 }
 }
 if ($pingCode -eq 200) {
 	Say "$pingUrl -> 200"
+} elseif ($pingCode -eq -1) {
+	Die $EX_PLATFORM "$pingUrl answered 200 but sent '$pingType', not JSON: something other than the agent API is answering - typically a tunnel's browser warning page or a proxy's own error page, both of which answer 200. Open that URL in a browser to see whose page it is."
 } elseif ($pingCode -eq 0) {
 	Die $EX_PLATFORM "cannot reach $PlatformUrl : check the URL, DNS, egress rules and TLS trust from this host (set HTTPS_PROXY if this host needs a proxy)"
 } else {
@@ -419,8 +451,21 @@ function Fetch-Json { param([string]$url)
 			# PowerShell 5.1 .Content is a Byte[] (not a string) and Byte[] | ConvertFrom-Json
 			# silently yields $null — the manifest would parse to nothing and the installer would
 			# report "no version field". Decode to UTF-8 text before parsing.
-			$content = (Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60).Content
+			$resp = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 60 `
+				-UserAgent $PlatformUA -Headers $PlatformHeaders
+			$content = $resp.Content
 			if ($content -is [byte[]]) { $content = [Text.Encoding]::UTF8.GetString($content) }
+			# NAME WHAT ARRIVED. `ConvertFrom-Json` reports the first word it choked on and nothing
+			# else: a whole HTML page became "Invalid JSON primitive: You.", which sent somebody
+			# looking for a platform fault when the body was a tunnel's browser warning. The content
+			# type and the opening of the body say in one line whose page this is.
+			$ctype = ''
+			try { $ctype = [string]$resp.Headers['Content-Type'] } catch { }
+			if ($ctype -and $ctype -notmatch 'json') {
+				$opening = ($content -replace '\s+', ' ').Trim()
+				if ($opening.Length -gt 160) { $opening = $opening.Substring(0, 160) + '...' }
+				throw "expected JSON, the server sent $ctype -- $opening"
+			}
 			$parsed = $content | ConvertFrom-Json
 			if (-not $parsed) { throw "empty or unparseable JSON" }
 			return $parsed
@@ -511,11 +556,46 @@ Say "$InstallDir\$AgentBin, $configDir, $logsDir"
 $tmp = Join-Path ([IO.Path]::GetTempPath()) ("aispm-install-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Force -Path $tmp | Out-Null
 try {
+	# Runs the agent binary and returns its exit code, with everything it said shown as TEXT.
+	#
+	# Start-Process with redirected streams, not the call operator, and the reason is how PowerShell
+	# treats a native command's stderr: it wraps each line in an ErrorRecord. The agent logs its
+	# utility runs to stderr DELIBERATELY - reusing the configured file logger would truncate the
+	# running agent's own log from a short installer run - so every log line it writes came back
+	# dressed as a failure. Observed on a real install, from a single INFO line:
+	#
+	#   aispm-agent.exe : time=... level=INFO msg="gpu: display adapters enumerated" ...
+	#   At C:\...\install.ps1:753 char:2
+	#   + & (Join-Path $InstallDir $AgentBin) -preflight-save -config $conf ...
+	#       + FullyQualifiedErrorId : NativeCommandError
+	#
+	# which reads as a broken install and is not one - the agent was announcing its display
+	# adapters. Under $ErrorActionPreference = 'Stop' the same line THROWS, which is why every call
+	# site used to lift the preference; redirecting the streams removes the need and the noise
+	# together, and the exit code comes from the process rather than from $LASTEXITCODE.
+	function Invoke-Agent {
+		param([string[]]$Arguments, [string]$Label, [string]$AppendTo)
+		$outFile = Join-Path $tmp "agent-$Label.out"
+		$errFile = Join-Path $tmp "agent-$Label.err"
+		$proc = Start-Process -FilePath (Join-Path $InstallDir $AgentBin) -ArgumentList $Arguments `
+			-NoNewWindow -Wait -PassThru -RedirectStandardOutput $outFile -RedirectStandardError $errFile
+		# stdout first: for every one of these runs it carries the VERDICT, and stderr carries the
+		# agent's own log about producing it.
+		$said = @()
+		foreach ($f in @($outFile, $errFile)) {
+			if (Test-Path -LiteralPath $f) { $said += @(Get-Content -LiteralPath $f -ErrorAction SilentlyContinue) }
+		}
+		foreach ($line in $said) { Write-Host $line }
+		if ($AppendTo) { $said | Add-Content -LiteralPath $AppendTo -Encoding UTF8 }
+		return [int]$proc.ExitCode
+	}
+
 	function Get-Verified { param([string]$url, [string]$sha256, [string]$dest, [string]$label)
 		Say $url
 		# The agent is ~190 MB: TimeoutSec here bounds the whole transfer, so it has to allow for a
 		# slow link rather than a fast one.
-		try { Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $dest -TimeoutSec 3600 }
+		try { Invoke-WebRequest -Uri $url -UseBasicParsing -OutFile $dest -TimeoutSec 3600 `
+				-UserAgent $PlatformUA -Headers $PlatformHeaders }
 		catch { Die $EX_DOWNLOAD "cannot download $label from $url ($($_.Exception.Message))" }
 		$got = (Get-FileHash -Algorithm SHA256 -LiteralPath $dest).Hash.ToLower()
 		if ($got -ne $sha256.ToLower()) {
@@ -702,12 +782,8 @@ try {
 	if ($Force) { $gate = '-Force: a failed check does NOT block' }
 	Add-Content -LiteralPath $preflightLog -Encoding UTF8 -Value ""
 	Add-Content -LiteralPath $preflightLog -Encoding UTF8 -Value "=== $stamp - $kind of $Version - $gate ==="
-	$prevEap = $ErrorActionPreference
-	$ErrorActionPreference = 'Continue' # a native non-zero exit throws under Stop from PS 7.4
-	& (Join-Path $InstallDir $AgentBin) -preflight-save -config $configDir 2>&1 |
-		Tee-Object -FilePath $preflightLog -Append
-	$preflightCode = $LASTEXITCODE
-	$ErrorActionPreference = $prevEap
+	$preflightCode = Invoke-Agent -Arguments @('-preflight-save', '-config', $configDir) `
+		-Label 'preflight' -AppendTo $preflightLog
 	Say "the preflight verdict was written to $preflightLog"
 
 	if ($preflightCode -ne 0) {
@@ -738,15 +814,11 @@ try {
 	}
 
 	Step "Enrolling agent $Version with $PlatformUrl"
-	# Same reason as the configuration fetch below: from PowerShell 7.4 a non-zero native exit throws
-	# while the preference is Stop. A throw here would replace the exit code and its remediation text
-	# with a PowerShell error, so the operator would learn that something failed but not which of the
-	# four enrollment faults it was.
-	$prevEap = $ErrorActionPreference
-	$ErrorActionPreference = 'Continue'
-	& (Join-Path $InstallDir $AgentBin) -enroll-only -config $configDir
-	$enrollCode = $LASTEXITCODE
-	$ErrorActionPreference = $prevEap
+	# Through Invoke-Agent, like every call to the binary: a non-zero exit must reach the switch
+	# below as a NUMBER. Let PowerShell see it as a native failure and the exit code and its
+	# remediation are replaced by a PowerShell error, so the operator learns that something failed
+	# but not which of the four enrollment faults it was.
+	$enrollCode = Invoke-Agent -Arguments @('-enroll-only', '-config', $configDir) -Label 'enroll'
 	if ($enrollCode -ne 0) {
 		switch ($enrollCode) {
 			10 { Write-Host "`nThe bootstrap token was rejected. Issue a new one from Agents Fleet -> Deploy agent (or POST $PlatformUrl/aispm/api/v1/agent/admin/bootstrap-tokens with a tenant API key carrying agent:manage) and re-run this installer; tokens are single-use and short-lived." }
@@ -768,15 +840,10 @@ try {
 	# supported way to run, and the agent retries on its own. Only a REFUSED manifest (22) and a
 	# configuration fault (12) are worth a word to the operator.
 	Step "Fetching the configuration the platform publishes"
-	# ErrorActionPreference is lifted around the call, and must stay lifted. From PowerShell 7.4 a
-	# native command exiting non-zero THROWS while the preference is Stop, and here a non-zero exit is
-	# the ordinary case - "nothing is published yet" is code 20 - so leaving it in place would abort a
-	# perfectly good installation on the most common outcome of all.
-	$prevEap = $ErrorActionPreference
-	$ErrorActionPreference = 'Continue'
-	& (Join-Path $InstallDir $AgentBin) -config-fetch-only -config $configDir
-	$cfgCode = $LASTEXITCODE
-	$ErrorActionPreference = $prevEap
+	# Through Invoke-Agent for the same reason, and here it matters most: a non-zero exit is the
+	# ORDINARY case - "nothing is published yet" is code 20 - so a call that let PowerShell treat it
+	# as a failure would abort a perfectly good installation on the most common outcome of all.
+	$cfgCode = Invoke-Agent -Arguments @('-config-fetch-only', '-config', $configDir) -Label 'configfetch'
 	switch ($cfgCode) {
 		0  { }
 		20 { Say "nothing is published for this agent yet - the catalogues this installer shipped are in effect" }

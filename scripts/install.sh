@@ -45,6 +45,15 @@ AGENT_BIN="aispm-agent"
 # also what every instruction prints; /etc/systemd/system is the admin-owned directory, which is
 # where a locally-installed unit belongs (never /lib or /usr/lib, which packages own).
 SYSTEMD_DIR="/etc/systemd/system"
+# How this installer identifies itself on platform calls. curl's own UA was never mistaken for a
+# browser - the Windows installer's was, and an ngrok free tunnel answered it with an HTML
+# interstitial instead of JSON (measured 2026-11-11, ERR_NGROK_6024; see install.ps1). So this side
+# was never broken, and it says who it is for the same two reasons the other side now does: a
+# platform's access log can tell an install from a browser, and nothing here should depend on a
+# tunnel's idea of what a browser looks like.
+INSTALLER_UA="aispm-agent-installer (posix)"
+NGROK_HDR="ngrok-skip-browser-warning: true"
+
 SYSTEMD_UNIT="aispm-agent.service"
 
 # macOS service identity. The label is the daemon's name to launchctl and the plist's basename;
@@ -342,7 +351,8 @@ step "Checking that the platform is reachable"
 # /aispm/api/v1/agent/ — which is exactly the misconfiguration worth catching before enrolling.
 # curl already writes 000 when it never got a response; do not append a second fallback, or the
 # "unreachable" branch below stops matching and the operator gets the wrong guidance.
-ping_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$platform_url$PING_PATH" 2>/dev/null) || true
+ping_code=$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 \
+	-A "$INSTALLER_UA" -H "$NGROK_HDR" "$platform_url$PING_PATH" 2>/dev/null) || true
 [ -n "$ping_code" ] || ping_code="000"
 if [ "$ping_code" = "200" ]; then
 	say "  $platform_url$PING_PATH -> 200"
@@ -395,19 +405,26 @@ linux)
 
   Captured:     processes — exec and exit from the kernel's netlink connector, with their
                 command lines, owners and qualification (MCP servers, inference engines, AI
-                desktop clients); the TCP ports they listen on; and a poll of their
-                established TCP connections.
-  Also captured: the PLAINTEXT of what applications send, through eBPF uprobes on OpenSSL
-                (SSL_write/SSL_read) — no injection into the target; and container attribution,
-                enriched from the runtime.
-  NOT captured: byte volumes, UDP flows, any connection that opens and closes between two polls,
-                and TLS from a stack with no C function to probe (Go crypto/tls, Rust rustls,
-                Java JSSE do their record layer in their own language).
+                desktop clients), and the TCP ports they listen on.
+  Connections:  from the KERNEL, as they happen — the 5-tuple, BYTE VOLUMES, UDP flows per peer,
+                who opened the connection (observed, not guessed from a port), and the
+                containers' own network namespaces.
+  Also captured: what applications SEND — the plaintext of TLS through eBPF uprobes on OpenSSL
+                (SSL_write/SSL_read), and the CLEARTEXT of anything that does not use TLS at all:
+                a local inference engine, an MCP or A2A server, an application behind a reverse
+                proxy. No injection into any target. Plus container attribution, enriched from
+                the runtime.
+  NOT captured: TLS from a stack with no C function to probe (Go crypto/tls, Rust rustls, Java
+                JSSE do their record layer in their own language — their CLEARTEXT is still
+                captured, only their TLS is out of reach); the content of a write scattered
+                across several buffers (its SIZE is still counted); and an application protocol
+                identified by signature for a process this agent was not told to look inside.
 
-  The communications layer needs BTF, CAP_BPF and a readable libssl. Without any of them it
-  degrades to none — nothing about WHAT an application sends — and the agent declares that, so
-  this host shows up with no communications rather than with none found. The preflight's
-  ebpf-support check answers it before anything is installed.
+  Both of those layers need BPF. Connections fall back to polling /proc/net — which costs the
+  byte volumes, the UDP flows, and any connection that opens and closes between two polls — and
+  communications fall back to nothing at all. The agent DECLARES whichever it is running, so this
+  host shows up with the coverage it actually has rather than with none found. The preflight's
+  ebpf-support check answers it before anything is installed, and names what each loss costs.
 
   If the netlink connector cannot be subscribed to (no CAP_NET_ADMIN, no CONFIG_CONNECTOR), the
   agent falls back to sweeping /proc, says so in its log, and DECLARES the lower coverage — a
@@ -416,7 +433,8 @@ linux)
   This agent reports its own coverage to the platform, so this host appears as partially
   covered rather than as a fully monitored host that happened to find nothing.
 
-  Full coverage is Windows (install.ps1 or install.cmd from the same package).
+  Communications are what is still partial here; Windows remains the only full-coverage OS
+  (install.ps1 or install.cmd from the same package).
 
 PARTIAL
 	;;
@@ -445,10 +463,10 @@ fetch() { # <url> -> body on stdout
 		if [ "$i" -lt 3 ]; then
 			# Quiet on the attempts that will be retried: three "curl: (56) 404" lines ahead of
 			# the real message only obscures it.
-			curl -fsSL --max-time 60 "$1" 2>/dev/null && return 0
+			curl -fsSL --max-time 60 -A "$INSTALLER_UA" -H "$NGROK_HDR" "$1" 2>/dev/null && return 0
 			sleep $((i * 3))
 		else
-			curl -fsSL --max-time 60 "$1" && return 0
+			curl -fsSL --max-time 60 -A "$INSTALLER_UA" -H "$NGROK_HDR" "$1" && return 0
 		fi
 		i=$((i + 1))
 	done
